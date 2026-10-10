@@ -332,3 +332,61 @@ form.inline-form {
 #space {
     height: 2em;
 }
+
+/* Vector graphic export dialog */
+.vector-export-overlay {
+    position: fixed;
+    inset: 0;
+    z-index: 3;
+    background: rgba(0, 0, 0, 0.4);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+.vector-export {
+    background: white;
+    border-radius: 4px;
+    padding: 1em;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 1em;
+    max-width: 95vw;
+    max-height: 95vh;
+    overflow: auto;
+}
+.vector-export-preview {
+    width: 500px;
+    height: 500px;
+    max-width: 90vw;
+    border: 1px solid #ccc;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+.vector-export-preview svg {
+    width: 100%;
+    height: 100%;
+}
+.vector-export-controls {
+    width: 16em;
+}
+.vector-export-controls h1 {
+    margin: 0 0 0.5em 0;
+    font-size: 120%;
+    font-weight: bold;
+}
+.vector-export-controls label {
+    display: block;
+    margin: 0.4em 0;
+}
+.vector-export-controls input[type=number] {
+    width: 5em;
+}
+.vector-export-status {
+    min-height: 2.5em;
+    font-size: 90%;
+    color: #555;
+}
+.vector-export-buttons input {
+    margin: 2px 0;
+}

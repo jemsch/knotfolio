@@ -10,6 +10,7 @@ import Q from "./kq.mjs";
 import {signature} from "./matrix.mjs";
 import {arrow_varnames} from "./atl.mjs";
 import * as expr from "./expr.mjs";
+import {show_export_dialog} from "./vectorexport.mjs";
 
 let global_tool_state = {
   tool: "crossing-change"
@@ -442,6 +443,17 @@ export class KnotDiagramView {
       let view = this.copy();
       view.reset_zoom();
       undo_stack.push(view);
+    });
+
+    $div.append(Q.create("h2").append("Export"));
+
+    let $export = Q.create("input")
+        .prop("type", "button")
+        .value("Export vector graphic")
+        .prop("title", "Export a smoothed SVG or TikZ drawing of the diagram in its current projection")
+        .appendTo($div);
+    $export.on("click", e => {
+      show_export_dialog(this.diagram);
     });
 
     $div.append(Q.create("hr"));
