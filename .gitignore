@@ -1,0 +1,4 @@
+local/www/
+_site/
+.claude/
+node_modules/
