@@ -8,6 +8,7 @@ import {KnotGraph} from "./knotgraph.mjs";
 import {KnotImageImportView} from "./KnotImageImportView.mjs";
 import {KnotDiagramView} from "./KnotDiagramView.mjs";
 import {P,X} from "./pd.mjs";
+import {extract_kirby_marks} from "./kirbyraster.mjs";
 import Q from "./kq.mjs";
 
 const EPSILON = 1e-2;
@@ -282,10 +283,18 @@ export class KnotRasterView {
     $div.append(Q.create("hr"));
 
     $div.append(Q.create("input", {type: "button",
-                                   title: "Analyze picture and convert to a diagram"})
-                .value("Convert to diagram")
+                                   title: "Analyze picture and convert to a link diagram"})
+                .value("Convert to link diagram")
                 .on("click", e => {
                   undo_stack.push(this.convert());
+                }));
+    $div.append(Q.create("br"));
+    $div.append(Q.create("input", {type: "button",
+                                   title: "Convert to a Kirby diagram: dots on components become 1-handles, and small"
+                                          + " labels next to components become framings (without computing invariants)"})
+                .value("Convert to Kirby diagram")
+                .on("click", e => {
+                  undo_stack.push(this.convert_kirby());
                 }));
     $div.append(Q.create("br"));
     $div.append(Q.create("label", {title: "Calculate invariants and identify the knot."
@@ -800,6 +809,40 @@ export class KnotRasterView {
         }
       }
     }
+  }
+
+  convert_kirby() {
+    /* Like convert, but first separates out Kirby diagram decorations (dotted circles and framing
+       labels), which are then attached to the components of the resulting diagram. */
+    let raw = this.copy();
+    raw.strip_errors();
+    let skel = raw.copy();
+    skel.clean_up();
+    let marks = extract_kirby_marks(raw.buffer, skel.buffer, raw.width, raw.height);
+    // Convert the already-thinned picture, since thinning a thick picture again is slow.
+    skel.calculate_invariants = false;
+    let result = skel.convert();
+    if (!(result instanceof KnotDiagramView)) {
+      marks.unresolved.forEach(pt => result.add_error(pt));
+      return result;
+    }
+    let diag = result.diagram;
+    let dotted = new Set; // edges of dotted components
+    marks.dots.forEach(pt => {
+      let near = diag.nearest_edge(pt, eid => !dotted.has(eid));
+      if (near === null) return;
+      diag.annotations.push({kind: "dot", edge: near.eid, pos: near.q});
+      diag.component_edges(near.eid).forEach(e => dotted.add(e));
+    });
+    let framed = new Set;
+    marks.labels.forEach(pt => {
+      // Dotted circles are 1-handles and have no framing.
+      let near = diag.nearest_edge(pt, eid => !dotted.has(eid) && !framed.has(eid));
+      if (near === null) return;
+      diag.annotations.push({kind: "framing", edge: near.eid, pos: pt, text: "?"});
+      diag.component_edges(near.eid).forEach(e => framed.add(e));
+    });
+    return result;
   }
 
   convert() {

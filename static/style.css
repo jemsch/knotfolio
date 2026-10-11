@@ -390,3 +390,18 @@ form.inline-form {
 .vector-export-buttons input {
     margin: 2px 0;
 }
+
+.icon-button.icon-text {
+    font-family: "Times New Roman", serif;
+    font-style: italic;
+    font-size: 20px;
+    line-height: 24px;
+    text-align: center;
+    vertical-align: top;
+}
+.kirby-note {
+    background: #ffd;
+    border: 1px solid #cc8;
+    padding: 0.3em;
+    font-size: 90%;
+}

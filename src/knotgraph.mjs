@@ -4,19 +4,52 @@ import {Point, segments_intersect} from "./geom2d.mjs";
 import {PD,P,X,Xp,Xm,Virtual} from "./pd.mjs";
 
 export class KnotGraph {
-  constructor(verts, edges, adjs) {
+  constructor(verts, edges, adjs, annotations=[]) {
     this.verts = verts; // [Point,...]
     this.edges = edges; // [[vtx id, vtx id, comp],...]
     this.adjs = adjs; // [P or X,...] where the P and X objects contain dart ids
     // a dart is edgeid+1 or -edgeid-1 depending on which side the edge is
+    // Kirby diagram decorations, each attached to the component containing `edge`:
+    // [{kind: "framing", edge: eid, pos: Point, text: string} or {kind: "dot", edge: eid, pos: Point}]
+    this.annotations = annotations;
   }
 
   copy() {
     return new KnotGraph(
       this.verts.map(pt => pt.copy()),
       this.edges.map(edge => edge.slice()),
-      this.adjs.map(list => list.slice())
+      this.adjs.map(list => list.slice()),
+      this.annotations.map(a => Object.assign({}, a, {pos: a.pos.copy()}))
     );
+  }
+
+  component_edges(eid) {
+    /* The set of edge ids in the component containing the given edge. */
+    return new Set(this.dart_circuit(eid + 1).map(d => Math.abs(d) - 1));
+  }
+
+  nearest_edge(pt, allowed=null) {
+    /* The edge closest to pt (optionally only among edges for which allowed(eid) is true),
+       as {eid, q, dist} where q is the closest point on it, or null. */
+    let best = null;
+    this.edges.forEach((edge, eid) => {
+      if (allowed && !allowed(eid)) return;
+      let p1 = this.verts[edge[0]], p2 = this.verts[edge[1]];
+      let dx = p2.x - p1.x, dy = p2.y - p1.y, len2 = dx*dx + dy*dy;
+      let t = len2 > 0 ? Math.max(0, Math.min(1, ((pt.x - p1.x)*dx + (pt.y - p1.y)*dy) / len2)) : 0;
+      let q = new Point(p1.x + t*dx, p1.y + t*dy);
+      let dist = Point.dist(q, pt);
+      if (best === null || dist < best.dist) best = {eid, q, dist};
+    });
+    return best;
+  }
+
+  component_annotations(eid) {
+    /* The indices of the annotations attached to the component containing the given edge. */
+    let edges = this.component_edges(eid);
+    let idxs = [];
+    this.annotations.forEach((a, i) => { if (edges.has(a.edge)) idxs.push(i); });
+    return idxs;
   }
 
   consistency_check() {
@@ -301,6 +334,10 @@ export class KnotGraph {
         }
       }
     }
+    // this.edges now holds forwarding pointers (or null for deleted edges)
+    this.annotations = this.annotations
+      .filter(a => this.edges[a.edge] !== null)
+      .map(a => Object.assign({}, a, {edge: this.edges[a.edge]}));
     this.verts = newverts;
     this.edges = newedges;
     this.adjs = newadjs;
@@ -1376,6 +1413,7 @@ export class KnotGraph {
     this.verts = [];
     this.edges = [];
     this.adjs = [];
+    this.annotations = []; // the re-embedding does not keep track of where annotations go
 
     let num_parts = skel.loops.length + skel.parts.length;
     let cols = Math.ceil(Math.sqrt(num_parts));

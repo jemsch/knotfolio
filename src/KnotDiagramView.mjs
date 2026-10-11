@@ -10,7 +10,11 @@ import Q from "./kq.mjs";
 import {signature} from "./matrix.mjs";
 import {arrow_varnames} from "./atl.mjs";
 import * as expr from "./expr.mjs";
-import {show_export_dialog} from "./vectorexport.mjs";
+import {show_export_dialog, plain_label} from "./vectorexport.mjs";
+
+const LABEL_OFFSET = 16; // distance from the curve (in diagram pixels) for new framing labels
+const LABEL_GRAB_RADIUS = 14; // how close a click must be to a label to grab it
+const DOT_RADIUS = 5;
 
 let global_tool_state = {
   tool: "crossing-change"
@@ -45,6 +49,7 @@ export class KnotDiagramView {
     this.c = new Point(0, 0);
     this.zoom = 1;
     this.moving = null; // if we are currently translating the diagram, is a Point
+    this.dragging = null; // if we are currently dragging a Kirby label, {view, index, start, moved}
 
     if (this.calculate_invariants) {
       this.mode_name = "Diagrams"; // constant
@@ -144,6 +149,41 @@ export class KnotDiagramView {
 
   }
 
+  nearest_on_circuit(circuit, pt) {
+    /* The closest point to pt on the given circuit, with the edge it lies on and a unit normal. */
+    let diag = this.diagram;
+    let best = null;
+    circuit.forEach(dart => {
+      let p1 = diag.verts[diag.dart_start(dart)], p2 = diag.verts[diag.dart_end(dart)];
+      let dx = p2.x - p1.x, dy = p2.y - p1.y, len2 = dx*dx + dy*dy;
+      let t = len2 > 0 ? Math.max(0, Math.min(1, ((pt.x - p1.x)*dx + (pt.y - p1.y)*dy) / len2)) : 0;
+      let q = new Point(p1.x + t*dx, p1.y + t*dy);
+      let d = Point.dist(q, pt);
+      if (best === null || d < best.dist) {
+        let len = Math.sqrt(len2) || 1;
+        best = {q: q, dist: d, eid: Math.abs(dart) - 1, normal: new Point(-dy/len, dx/len)};
+      }
+    });
+    return best;
+  }
+
+  find_label(pt) {
+    /* The index of the framing label near pt, or null. */
+    let found = null, dist = LABEL_GRAB_RADIUS*this.zoom;
+    this.diagram.annotations.forEach((a, i) => {
+      if (a.kind === "framing" && Point.dist(a.pos, pt) <= dist) {
+        dist = Point.dist(a.pos, pt);
+        found = i;
+      }
+    });
+    return found;
+  }
+
+  ask_framing(current) {
+    let text = window.prompt("Framing for this component (for example 0, -1, <2>, 1/2).\nLeave empty to remove it.", current);
+    return text === null ? null : text.trim();
+  }
+
   mousedown(pt, e, undo_stack, ctxt) {
     pt = this.mouse_to_pt(pt);
     let tool = global_tool_state.tool;
@@ -201,6 +241,58 @@ export class KnotDiagramView {
         undo_stack.push(view);
         return;
       }
+    } else if (tool === "kirby-framing") {
+      let label = this.find_label(pt);
+      if (label !== null) {
+        // Drag the label, or edit it on mouseup if it was not moved.
+        this.dragging = {view: this.copy(), index: label, start: pt, moved: false};
+        return;
+      }
+      let circuit = this.find_closest_circuit(pt);
+      if (circuit !== null) {
+        let near = this.nearest_on_circuit(circuit, pt);
+        let existing = this.diagram.component_annotations(near.eid)
+            .find(i => this.diagram.annotations[i].kind === "framing");
+        let text = this.ask_framing(existing !== undefined ? this.diagram.annotations[existing].text : "0");
+        if (text === null) return;
+        let view = this.copy();
+        let diag = view.diagram;
+        // A component has at most one framing, and dotted circles (1-handles) have no framing.
+        let drop = new Set(diag.component_annotations(near.eid));
+        diag.annotations = diag.annotations.filter((a, i) => !drop.has(i));
+        if (text !== "") {
+          let side = Math.sign((pt.x - near.q.x)*near.normal.x + (pt.y - near.q.y)*near.normal.y);
+          if (near.dist < 3) {
+            // Clicked right on the curve: put the label on the outside of the component.
+            let cx = 0, cy = 0;
+            circuit.forEach(d => { cx += diag.verts[diag.dart_start(d)].x; cy += diag.verts[diag.dart_start(d)].y; });
+            cx /= circuit.length; cy /= circuit.length;
+            side = Math.sign((near.q.x - cx)*near.normal.x + (near.q.y - cy)*near.normal.y) || 1;
+          }
+          let off = Math.max(LABEL_OFFSET, near.dist);
+          diag.annotations.push({kind: "framing", edge: near.eid, text: text,
+                                 pos: new Point(near.q.x + side*off*near.normal.x, near.q.y + side*off*near.normal.y)});
+        }
+        undo_stack.push(view);
+        return;
+      }
+    } else if (tool === "kirby-dot") {
+      let circuit = this.find_closest_circuit(pt);
+      if (circuit !== null) {
+        let near = this.nearest_on_circuit(circuit, pt);
+        let view = this.copy();
+        let diag = view.diagram;
+        let mine = diag.component_annotations(near.eid);
+        let had_dot_here = mine.some(i => diag.annotations[i].kind === "dot"
+                                     && Point.dist(diag.annotations[i].pos, near.q) <= 3*DOT_RADIUS*this.zoom);
+        let drop = new Set(mine);
+        diag.annotations = diag.annotations.filter((a, i) => !drop.has(i));
+        if (!had_dot_here) {
+          diag.annotations.push({kind: "dot", edge: near.eid, pos: near.q});
+        }
+        undo_stack.push(view);
+        return;
+      }
     } else if (tool.startsWith("set-color-")) {
       let color = +tool.slice("set-color-".length);
       let circuit = this.find_closest_circuit(pt);
@@ -230,8 +322,23 @@ export class KnotDiagramView {
       this.c = old_c;
       return;
     }
+    if (this.dragging) {
+      let dr = this.dragging;
+      if (Point.dist(pt, dr.start) > 3) dr.moved = true;
+      let orig = this.diagram.annotations[dr.index].pos;
+      dr.view.diagram.annotations[dr.index].pos = new Point(orig.x + pt.x - dr.start.x, orig.y + pt.y - dr.start.y);
+      dr.view.paint(ctxt);
+      return;
+    }
     let tool = global_tool_state.tool;
-    if (tool === "crossing-change") {
+    if (tool === "kirby-framing" || tool === "kirby-dot") {
+      this.paint(ctxt);
+      if (tool === "kirby-framing" && this.find_label(pt) !== null) return;
+      let circuit = this.find_closest_circuit(pt);
+      if (circuit !== null) {
+        this.highlight_circuit(ctxt, circuit);
+      }
+    } else if (tool === "crossing-change") {
       this.paint(ctxt);
       let closest = this.find_closest_crossing(pt);
       if (closest !== null) {
@@ -272,7 +379,28 @@ export class KnotDiagramView {
       this.paint(ctxt);
       return;
     }
-    let tool = global_tool_state.tool;
+    if (this.dragging) {
+      let dr = this.dragging;
+      this.dragging = null;
+      if (dr.moved) {
+        undo_stack.push(dr.view);
+        return;
+      }
+      let a = this.diagram.annotations[dr.index];
+      let text = this.ask_framing(a.text);
+      if (text === null) {
+        this.paint(ctxt);
+        return;
+      }
+      let view = this.copy();
+      if (text === "") {
+        view.diagram.annotations.splice(dr.index, 1);
+      } else {
+        view.diagram.annotations[dr.index].text = text;
+      }
+      undo_stack.push(view);
+      return;
+    }
   }
   mousewheel(pt, e, undo_stack, ctxt) {
     if (this.moving) {
@@ -331,6 +459,16 @@ export class KnotDiagramView {
           .appendTo($b);
     });
 
+    $tools.append(Q.create("br"));
+    Q.span("n").addClass("icon-button").addClass("icon-text")
+      .prop("data-tool", "kirby-framing")
+      .prop("title", "Kirby diagram: click a component to set its framing; drag a label to move it, click it to edit")
+      .appendTo($tools);
+    Q.span("\u2022").addClass("icon-button").addClass("icon-text")
+      .prop("data-tool", "kirby-dot")
+      .prop("title", "Kirby diagram: click a component to make it a dotted circle (1-handle); click the dot to remove it")
+      .appendTo($tools);
+
     this.update_tool = (toolname) => {
       $div.query(".icon-button").forEach($e => {
         let button_tool = $e.prop("data-tool");
@@ -340,6 +478,13 @@ export class KnotDiagramView {
       });
     };
     this.update_tool(global_tool_state.tool);
+
+    let unknown = diagram.annotations.filter(a => a.kind === "framing" && a.text === "?").length;
+    if (unknown > 0) {
+      Q.p(`This Kirby diagram has ${unknown} framing label${unknown > 1 ? "s" : ""} shown as "?". `
+          + "Choose the n tool and click each label to type its value.")
+        .addClass("kirby-note").appendTo($div);
+    }
 
     $tools.on("click", e => {
       let el = e.target.closest('.icon-button');
@@ -1101,6 +1246,22 @@ export class KnotDiagramView {
         }
       });
     }
+
+    diag.annotations.forEach(a => {
+      let x = getX(a.pos.x)+0.5, y = getY(a.pos.y)+0.5;
+      if (a.kind === "dot") {
+        ctxt.beginPath();
+        ctxt.arc(x, y, DOT_RADIUS, 0, 2*Math.PI);
+        ctxt.fillStyle = hex_to_rgb(palette[diag.edges[a.edge][2]-1]);
+        ctxt.fill();
+      } else {
+        ctxt.font = "16px serif";
+        ctxt.textAlign = "center";
+        ctxt.textBaseline = "middle";
+        ctxt.fillStyle = "black";
+        ctxt.fillText(plain_label(a.text), x, y);
+      }
+    });
 
     if (0) {
       ctxt.fillStyle = "white";

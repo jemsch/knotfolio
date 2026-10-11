@@ -25,6 +25,11 @@ export class SmoothedDiagram {
     this.strands = []; // [{color, nodes: [global node ids, cyclic], kinds: ["over"|"under"|"virtual"|"", ...]}]
     this.virtuals = []; // global node ids of virtual crossings
     this.build(diag);
+    // Kirby diagram decorations, with the strand they belong to
+    this.annotations = diag.annotations.map(a => ({
+      kind: a.kind, text: a.text, pos: [a.pos.x, a.pos.y],
+      strand: this.strands.findIndex(st => st.edges.has(a.edge))
+    })).filter(a => a.strand >= 0);
     this.limited = false; // whether smoothing was reduced to preserve the diagram
     this.relax(smoothing_length(smoothing), perpendicular);
   }
@@ -109,7 +114,8 @@ export class SmoothedDiagram {
           });
         });
       }
-      this.strands.push({color: edge[2], nodes: nodes, kinds: node_kinds});
+      this.strands.push({color: edge[2], nodes: nodes, kinds: node_kinds,
+                         edges: new Set(circuit.map(d => Math.abs(d) - 1))});
     });
   }
 
@@ -434,10 +440,62 @@ function layout(sd, opts) {
     }
   });
 
+  // Kirby diagram decorations.  Dots go on the nearest point of the smoothed curve.  Labels keep their
+  // direction from the curve but are pushed out far enough that the text box clears the curve.
+  let dots = [], labels = [];
+  if (opts.kirby) {
+    sd.annotations.forEach(a => {
+      let {nodes, color} = sd.strands[a.strand];
+      let q = nodes[0], qd = Infinity;
+      nodes.forEach(v => {
+        let d = Math.hypot(pos[2 * v] - a.pos[0], pos[2 * v + 1] - a.pos[1]);
+        if (d < qd) { qd = d; q = v; }
+      });
+      let c = P(q);
+      if (a.kind === "dot") {
+        dots.push({color: color, center: c, r: 2.25 * line_width});
+      } else {
+        let size = opts.label_size;
+        let ux = (a.pos[0] - pos[2 * q]) / (qd || 1), uy = (a.pos[1] - pos[2 * q + 1]) / (qd || 1);
+        if (qd === 0) { ux = 0; uy = -1; }
+        let w = 0.55 * size * plain_label(a.text).length, h = 0.75 * size;
+        let support = Math.abs(ux) * w / 2 + Math.abs(uy) * h / 2;
+        let d = Math.max(qd * scale, line_width / 2 + 0.3 * size + support);
+        labels.push({text: a.text, center: [c[0] + d * ux, c[1] + d * uy], w: w, h: h});
+      }
+    });
+  }
+
+  // Grow the canvas so that labels and dots are not cut off.
+  let lo = [pad, pad], hi = [width - pad, height - pad];
+  let include = (x, y) => { lo = [Math.min(lo[0], x), Math.min(lo[1], y)]; hi = [Math.max(hi[0], x), Math.max(hi[1], y)]; };
+  labels.forEach(l => { include(l.center[0] - l.w / 2, l.center[1] - l.h / 2); include(l.center[0] + l.w / 2, l.center[1] + l.h / 2); });
+  dots.forEach(d => { include(d.center[0] - d.r, d.center[1] - d.r); include(d.center[0] + d.r, d.center[1] + d.r); });
+  let sx = pad - lo[0], sy = pad - lo[1];
+  let shift = p => [p[0] + sx, p[1] + sy];
+  paths.forEach(path => { path.pts = path.pts.map(shift); });
+  arrows.forEach(a => { a.tip = shift(a.tip); });
+  dots.forEach(d => { d.center = shift(d.center); });
+  labels.forEach(l => { l.center = shift(l.center); });
+
   return {
-    width: width, height: height, paths: paths, arrows: arrows,
-    virtuals: sd.virtuals.map(P)
+    width: hi[0] - lo[0] + 2 * pad, height: hi[1] - lo[1] + 2 * pad, paths: paths, arrows: arrows,
+    virtuals: sd.virtuals.map(P).map(shift), dots: dots, labels: labels
   };
+}
+
+/* Framing labels are typed as plain text, with <n> meaning an angle-bracketed (blackboard) framing. */
+export function plain_label(text) {
+  return text.replace(/\$/g, "").replace(/</g, "\u27e8").replace(/>/g, "\u27e9").replace(/-/g, "\u2212");
+}
+
+function tikz_label(text) {
+  if (text.includes("$")) return text; // already TeX
+  return "$" + text.replace(/</g, "\\langle ").replace(/>/g, "\\rangle ") + "$";
+}
+
+function svg_escape(text) {
+  return text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
 
 function uniform(pts, closed) {
@@ -551,6 +609,12 @@ export function to_svg(sd, opts) {
     let pts = arrow_points(a, opts.line_width);
     out.push(`<path fill="${hex(a.color, opts.colors)}" d="M${pts.map(p => fmt(p[0]) + "," + fmt(p[1])).join(" L")}Z"/>`);
   });
+  L.dots.forEach(d => {
+    out.push(`<circle fill="${hex(d.color, opts.colors)}" cx="${fmt(d.center[0])}" cy="${fmt(d.center[1])}" r="${fmt(d.r)}"/>`);
+  });
+  L.labels.forEach(l => {
+    out.push(`<text x="${fmt(l.center[0])}" y="${fmt(l.center[1])}" font-family="'Times New Roman', Times, serif" font-size="${fmt(opts.label_size)}" text-anchor="middle" dominant-baseline="central" fill="#000000">${svg_escape(plain_label(l.text))}</text>`);
+  });
   out.push(`</svg>`);
   return out.join("\n") + "\n";
 }
@@ -581,6 +645,12 @@ export function to_tikz(sd, opts) {
   L.arrows.forEach(a => {
     let pts = arrow_points(a, opts.line_width);
     body.push(`\\fill[${color_name(a.color)}] ${pts.map(pt).join(" -- ")} -- cycle;`);
+  });
+  L.dots.forEach(d => {
+    body.push(`\\fill[${color_name(d.color)}] ${pt(d.center)} circle (${fmt(d.r)});`);
+  });
+  L.labels.forEach(l => {
+    body.push(`\\node[inner sep=0pt, font=\\fontsize{${fmt(opts.label_size)}}{${fmt(1.2 * opts.label_size)}}\\selectfont] at ${pt(l.center)} {${tikz_label(l.text)}};`);
   });
   let out = [];
   out.push(`% Generated by KnotFolio. Requires \\usepackage{tikz}${colors.size ? " (and xcolor)" : ""}.`);
@@ -617,6 +687,10 @@ export function show_export_dialog(diag) {
         <label><input type="checkbox" name="perpendicular" checked> Perpendicular crossings</label>
         <label><input type="checkbox" name="colors" checked> Component colors</label>
         <label><input type="checkbox" name="arrows"> Orientation arrows</label>
+        <div class="vector-export-kirby">
+          <label><input type="checkbox" name="kirby" checked> Framings and dots</label>
+          <label>Label size (pt) <input type="number" name="label_size" min="2" step="0.5" value="9"></label>
+        </div>
         <p class="vector-export-status"></p>
         <div class="vector-export-buttons">
           <input type="button" name="svg" value="Download SVG">
@@ -631,6 +705,8 @@ export function show_export_dialog(diag) {
   let preview = overlay.querySelector(".vector-export-preview");
   let status = overlay.querySelector(".vector-export-status");
 
+  if (diag.annotations.length === 0) overlay.querySelector(".vector-export-kirby").style.display = "none";
+
   let cache = new Map;
   let smoothed = () => {
     let s = +$("smoothing").value, perp = $("perpendicular").checked;
@@ -644,7 +720,9 @@ export function show_export_dialog(diag) {
     gap: Math.max(0, +$("gap").value || 0),
     margin: 2,
     colors: $("colors").checked,
-    arrows: $("arrows").checked
+    arrows: $("arrows").checked,
+    kirby: $("kirby").checked,
+    label_size: Math.max(1, +$("label_size").value || 9)
   });
   let update = () => {
     overlay.querySelector(".smoothing-value").textContent = $("smoothing").value;

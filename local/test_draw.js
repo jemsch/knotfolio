@@ -27,7 +27,7 @@ export async function run(curve_specs, {seed = 11, color = true} = {}) {
     if (down) fire('mouseup', pts[start]);
   });
   const wait = ms => new Promise(r => setTimeout(r, ms));
-  [...document.querySelectorAll('#tools input[type=button]')].find(b => b.value == 'Convert to diagram').click();
+  [...document.querySelectorAll('#tools input[type=button]')].find(b => b.value == 'Convert to link diagram').click();
   await wait(1500);
   if (color) { document.querySelector('input[value="Auto-color"]').click(); await wait(800); }
   document.querySelector('input[value="Export vector graphic"]').click();
