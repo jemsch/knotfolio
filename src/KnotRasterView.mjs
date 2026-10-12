@@ -818,10 +818,11 @@ export class KnotRasterView {
     raw.strip_errors();
     let skel = raw.copy();
     skel.clean_up();
+    let stroke_width = raw.stroke_width(skel);
     let marks = extract_kirby_marks(raw.buffer, skel.buffer, raw.width, raw.height);
     // Convert the already-thinned picture, since thinning a thick picture again is slow.
     skel.calculate_invariants = false;
-    let result = skel.convert();
+    let result = skel.convert(stroke_width);
     if (!(result instanceof KnotDiagramView)) {
       marks.unresolved.forEach(pt => result.add_error(pt));
       return result;
@@ -845,11 +846,24 @@ export class KnotRasterView {
     return result;
   }
 
-  convert() {
-    /* Returns a View of either a cleaned up version (with errors) or an interpreted knot diagram. */
+  stroke_width(thinned) {
+    /* Typical stroke width: ink pixels per pixel of the thinned picture. */
+    let ink = 0, thin = 0;
+    for (let i = 0; i < this.buffer.length; i++) {
+      if (this.buffer[i] > 0) ink++;
+      if (thinned.buffer[i] > 0) thin++;
+    }
+    return thin > 0 ? ink / thin : 1;
+  }
+
+  convert(stroke_width=null) {
+    /* Returns a View of either a cleaned up version (with errors) or an interpreted knot diagram.
+       stroke_width is the width of the original strokes, if this picture has already been thinned. */
 
     let knot = this.copy();
     knot.clean_up();
+    // Thinning thick strokes leaves longer spurs, so scale the spur length with the stroke width.
+    let spur_length = Math.max(SPUR_LENGTH, Math.ceil(1.5 * (stroke_width || this.stroke_width(knot))));
 
     let width = 0|knot.width,
         height = 0|knot.height,
@@ -906,7 +920,7 @@ export class KnotRasterView {
       for (let x = 1; x <= width - 2; x++) {
         if (buf[y*width+x] > 0 && n_neighbors(x, y) === 1) {
           // this is an endpoint
-          maybe_delete_spur(x, y, SPUR_LENGTH);
+          maybe_delete_spur(x, y, spur_length);
         }
       }
     }
@@ -994,7 +1008,18 @@ export class KnotRasterView {
               state = c;
             }
           }
-          if (pcount > 1) {
+          // Do not jump over another stroke end lying on the way (for example skipping over a short
+          // dash between two crossings): the right matching goes through that end instead.
+          let skips = false;
+          for (let k = 0; k < points.length && !skips; k++) {
+            if (k === i || k === j) continue;
+            let q = points[k];
+            let t = ((q.x - p1.x) * (p2.x - p1.x) + (q.y - p1.y) * (p2.y - p1.y)) / (d * d);
+            if (t <= 0.05 || t >= 0.95) continue;
+            let px = p1.x + t * (p2.x - p1.x), py = p1.y + t * (p2.y - p1.y);
+            if (Math.hypot(q.x - px, q.y - py) < 3) skips = true;
+          }
+          if (pcount > 1 && !skips) {
             // Then this is a non-backtracking line segment
             let count = Math.min(2, pcount-1);
             let score = (d - DIAGRAM_LINE_WIDTH*count) / count;

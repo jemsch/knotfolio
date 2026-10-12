@@ -19,7 +19,7 @@ export function smoothing_length(smoothing) {
 
 /* Smoothed geometry shared by all renderings of a diagram at a given smoothing level. */
 export class SmoothedDiagram {
-  constructor(diag, smoothing, perpendicular=false) {
+  constructor(diag, smoothing, perpendicular=false, symmetrize=false) {
     /* smoothing is in 0..10; 0 means just resample the drawn curve. */
     this.pos = []; // flat [x0, y0, x1, y1, ...] of global nodes
     this.strands = []; // [{color, nodes: [global node ids, cyclic], kinds: ["over"|"under"|"virtual"|"", ...]}]
@@ -31,7 +31,10 @@ export class SmoothedDiagram {
       strand: this.strands.findIndex(st => st.edges.has(a.edge))
     })).filter(a => a.strand >= 0);
     this.limited = false; // whether smoothing was reduced to preserve the diagram
+    this.baseline = this.count_intersections();
     this.relax(smoothing_length(smoothing), perpendicular);
+    this.symmetry = null; // description of what symmetrize did
+    if (symmetrize) this.symmetrize(smoothing_length(smoothing), perpendicular);
   }
 
   new_node(x, y) {
@@ -132,6 +135,259 @@ export class SmoothedDiagram {
     return occ;
   }
 
+  symmetrize(length, perpendicular) {
+    /* Make the drawing as mirror-symmetric as it nearly is.  First look for a mirror axis for the
+       whole diagram, under which each component goes to itself or to a partner component.
+       Components that do not fit it try an axis of their own.  Each point is then moved to the
+       average of itself and the reflection of its partner point, so the result is exactly symmetric
+       while staying as close as possible to the drawing.  Crossings are matched to crossings. */
+    const TOLERANCE = 0.06; // how far from symmetric a component may be, relative to its size
+    let original = this.pos.slice();
+    let strands = this.strands;
+
+    let measure = () => strands.map(({nodes, kinds}) => {
+      let pos = this.pos, m = nodes.length, cum = new Float64Array(m + 1);
+      let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+      for (let i = 0; i < m; i++) {
+        let a = nodes[i], b = nodes[(i + 1) % m];
+        cum[i + 1] = cum[i] + Math.hypot(pos[2 * b] - pos[2 * a], pos[2 * b + 1] - pos[2 * a + 1]);
+        x0 = Math.min(x0, pos[2 * a]); x1 = Math.max(x1, pos[2 * a]);
+        y0 = Math.min(y0, pos[2 * a + 1]); y1 = Math.max(y1, pos[2 * a + 1]);
+      }
+      let anchors = [], anchor_nodes = [];
+      kinds.forEach((k, i) => { if (k) { anchors.push(cum[i] / cum[m]); anchor_nodes.push(nodes[i]); } });
+      return {nodes, m, cum, L: cum[m], size: Math.hypot(x1 - x0, y1 - y0), anchors, anchor_nodes};
+    });
+    let at = (A, t) => {
+      /* The point at normalized arc length t (taken mod 1) along strand A. */
+      let pos = this.pos;
+      let u = (((t % 1) + 1) % 1) * A.L;
+      let lo = 0, hi = A.m;
+      while (hi - lo > 1) { let mid = (lo + hi) >> 1; if (A.cum[mid] <= u) lo = mid; else hi = mid; }
+      let a = A.nodes[lo], b = A.nodes[(lo + 1) % A.m];
+      let seg = A.cum[lo + 1] - A.cum[lo], f = seg > 0 ? (u - A.cum[lo]) / seg : 0;
+      return [pos[2 * a] + f * (pos[2 * b] - pos[2 * a]), pos[2 * a + 1] + f * (pos[2 * b + 1] - pos[2 * a + 1])];
+    };
+    let reflect = (axis, [x, y]) => {
+      let [px, py] = axis.p, [dx, dy] = axis.d;
+      let t = (x - px) * dx + (y - py) * dy;
+      return [2 * (px + t * dx) - x, 2 * (py + t * dy) - y];
+    };
+
+    let find_axis = pts => {
+      /* The mirror line through the centroid of pts that best maps pts onto themselves. */
+      let cx = 0, cy = 0;
+      pts.forEach(([x, y]) => { cx += x; cy += y; });
+      cx /= pts.length; cy /= pts.length;
+      let cell = 4 * SAMPLE_SPACING, grid = new Map;
+      pts.forEach(p => {
+        let key = Math.floor(p[0] / cell) + "," + Math.floor(p[1] / cell);
+        if (!grid.has(key)) grid.set(key, []);
+        grid.get(key).push(p);
+      });
+      let nearest = ([x, y]) => {
+        let gx = Math.floor(x / cell), gy = Math.floor(y / cell), best = 2 * cell;
+        for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) {
+          (grid.get((gx + dx) + "," + (gy + dy)) || []).forEach(q => { best = Math.min(best, Math.hypot(q[0] - x, q[1] - y)); });
+        }
+        return best;
+      };
+      let step = Math.max(1, Math.floor(pts.length / 400));
+      let cost = theta => {
+        let axis = {p: [cx, cy], d: [Math.cos(theta), Math.sin(theta)]};
+        let tot = 0, n = 0;
+        for (let i = 0; i < pts.length; i += step) { tot += nearest(reflect(axis, pts[i])); n++; }
+        return tot / n;
+      };
+      let best = 0, bc = Infinity;
+      for (let deg = 0; deg < 180; deg += 2) {
+        let c = cost(deg * Math.PI / 180);
+        if (c < bc) { bc = c; best = deg * Math.PI / 180; }
+      }
+      for (let h = Math.PI / 180; h > 0.0005; h /= 2) {
+        for (let th of [best - h, best + h]) { let c = cost(th); if (c < bc) { bc = c; best = th; } }
+      }
+      return {p: [cx, cy], d: [Math.cos(best), Math.sin(best)]};
+    };
+
+    let crossing_nodes = [];
+    strands.forEach(({nodes, kinds}) => nodes.forEach((v, i) => { if (kinds[i]) crossing_nodes.push(v); }));
+    crossing_nodes = [...new Set(crossing_nodes)];
+    let partner_cache = new Map;
+    let partner = (axis, X) => {
+      /* The crossing nearest to the mirror image of crossing X, if the pairing is mutual. */
+      if (!partner_cache.has(axis)) {
+        let pos = this.pos, near = new Map;
+        crossing_nodes.forEach(v => {
+          let r = reflect(axis, [pos[2 * v], pos[2 * v + 1]]), best = null, bd = Infinity;
+          crossing_nodes.forEach(u => {
+            let d = Math.hypot(pos[2 * u] - r[0], pos[2 * u + 1] - r[1]);
+            if (d < bd) { bd = d; best = u; }
+          });
+          near.set(v, best);
+        });
+        let mutual = new Map;
+        near.forEach((u, v) => { if (near.get(u) === v) mutual.set(v, u); });
+        partner_cache.set(axis, mutual);
+      }
+      return partner_cache.get(axis).get(X);
+    };
+
+    let fit = (A, B, axis) => {
+      /* The best correspondence t -> c + o t (mod 1) from strand A to strand B under the reflection,
+         refined so that crossings go to crossings when possible. */
+      const K = 96;
+      let samples = [];
+      for (let k = 0; k < K; k++) samples.push([k / K, reflect(axis, at(A, k / K))]);
+      let trial = (o, c) => {
+        let tot = 0;
+        samples.forEach(([t, r]) => { let q = at(B, c + o * t); tot += Math.hypot(r[0] - q[0], r[1] - q[1]); });
+        return tot / K;
+      };
+      let best = {o: 1, c: 0, cost: Infinity};
+      for (let o of [-1, 1]) for (let j = 0; j < 128; j++) {
+        let cost = trial(o, j / 128);
+        if (cost < best.cost) best = {o, c: j / 128, cost};
+      }
+      for (let h = 1 / 256; h > 1 / 8192; h /= 2) {
+        for (let c of [best.c - h, best.c + h]) { let cost = trial(best.o, c); if (cost < best.cost) best = {o: best.o, c, cost}; }
+      }
+      let {o, c} = best;
+      let map = t => c + o * t;
+      // Piecewise-linear correction so that each crossing of A lands exactly on its partner crossing
+      // in B.  Partners are decided once for the whole diagram, so that components sharing a crossing
+      // agree on where it goes.  Without a consistent correspondence the component is not symmetrized.
+      let n = A.anchors.length;
+      if (n > 0) {
+        let cyc = (a, b) => { let d = Math.abs(((a - b) % 1 + 1) % 1); return Math.min(d, 1 - d); };
+        let targets = [];
+        for (let j = 0; j < n; j++) {
+          let Y = partner(axis, A.anchor_nodes[j]);
+          let options = [];
+          B.anchor_nodes.forEach((node, k) => { if (node === Y) options.push(B.anchors[k]); });
+          if (options.length === 0) return {cost: Infinity};
+          let img = map(A.anchors[j]);
+          targets.push(options.reduce((x, y) => cyc(y, img) < cyc(x, img) ? y : x));
+        }
+        let steps = A.anchors.map((a, j) => ((o * (targets[(j + 1) % n] - targets[j])) % 1 + 1) % 1 || 1);
+        let total = steps.reduce((x, y) => x + y, 0);
+        if (n > 1 && Math.abs(total - 1) > 1e-6) return {cost: Infinity}; // order not preserved
+        map = t => {
+          let j = 0;
+          for (let k = 0; k < n; k++) {
+            if (((t - A.anchors[k]) % 1 + 1) % 1 < ((t - A.anchors[j]) % 1 + 1) % 1) j = k;
+          }
+          let span = ((A.anchors[(j + 1) % n] - A.anchors[j]) % 1 + 1) % 1 || 1;
+          let f = (((t - A.anchors[j]) % 1 + 1) % 1) / span;
+          return targets[j] + o * f * steps[j];
+        };
+      }
+      return {cost: best.cost, map};
+    };
+
+    let S = measure();
+    let all_pts = [];
+    S.forEach(A => { for (let i = 0; i < A.m; i++) all_pts.push(at(A, A.cum[i] / A.L)); });
+    let global = find_axis(all_pts);
+
+    // Decide what each component goes to.
+    let plan = new Array(S.length).fill(null); // {B, axis, map}
+    let best_under = (A, axis) => {
+      let best = null;
+      S.forEach((B, bi) => {
+        if (Math.abs(B.L / A.L - 1) > 0.3) return;
+        let f = fit(A, B, axis);
+        if (!best || f.cost < best.cost) best = Object.assign({B: bi}, f);
+      });
+      return best;
+    };
+    // Which components cross which: components that cross each other must use the same axis,
+    // since their crossings have to go to crossings.
+    let crossing_sets = strands.map(({nodes, kinds}) => new Set(nodes.filter((v, i) => kinds[i])));
+    let touches = (a, b) => [...crossing_sets[a]].some(v => crossing_sets[b].has(v));
+    let under_global = S.map(A => best_under(A, global));
+    let accept_global = (ai, tol) => {
+      let f = under_global[ai];
+      if (!f || f.cost > tol * S[ai].size) return false;
+      if (f.B !== ai && (!under_global[f.B] || under_global[f.B].B !== ai)) return false; // partners must agree
+      plan[ai] = {B: f.B, axis: global, map: f.map};
+      return true;
+    };
+    S.forEach((A, ai) => accept_global(ai, TOLERANCE));
+    // Components crossing a symmetrized one follow it, even if they are further from symmetric
+    // (for example a small circle drawn a little off the axis gets moved onto it).
+    for (let changed = true; changed;) {
+      changed = false;
+      S.forEach((A, ai) => {
+        if (plan[ai] || !S.some((B, bi) => plan[bi] && touches(ai, bi))) return;
+        if (accept_global(ai, 3 * TOLERANCE)) changed = true;
+      });
+    }
+    let own = 0;
+    S.forEach((A, ai) => {
+      // A component may only use its own axis if it does not cross any other component.
+      if (plan[ai] || S.some((B, bi) => bi !== ai && touches(ai, bi))) return;
+      let pts = [];
+      for (let i = 0; i < A.m; i++) pts.push(at(A, A.cum[i] / A.L));
+      let axis = find_axis(pts);
+      let f = fit(A, A, axis);
+      if (f.cost <= TOLERANCE * A.size) { plan[ai] = {B: ai, axis, map: f.map}; own++; }
+    });
+    let count = plan.filter(x => x).length;
+    if (count === 0) {
+      this.symmetry = "No mirror symmetry was found.";
+      return;
+    }
+
+    let average = () => {
+      /* Move each point of a planned component halfway to the reflection of its partner point. */
+      let S2 = measure();
+      let n = this.pos.length / 2, acc = new Float64Array(2 * n), cnt = new Float64Array(n);
+      plan.forEach((pl, ai) => {
+        if (!pl) return;
+        let A = S2[ai], B = S2[pl.B];
+        for (let i = 0; i < A.m; i++) {
+          let t = A.cum[i] / A.L, v = A.nodes[i];
+          let r = reflect(pl.axis, at(B, pl.map(t)));
+          acc[2 * v] += (this.pos[2 * v] + r[0]) / 2;
+          acc[2 * v + 1] += (this.pos[2 * v + 1] + r[1]) / 2;
+          cnt[v]++;
+        }
+      });
+      let next = this.pos.slice();
+      for (let v = 0; v < n; v++) {
+        if (cnt[v]) { next[2 * v] = acc[2 * v] / cnt[v]; next[2 * v + 1] = acc[2 * v + 1] / cnt[v]; }
+      }
+      this.pos = next;
+    };
+    average();
+    // Averaging can leave small kinks next to crossings, so smooth the symmetric shape again
+    // (straightening the crossings), and then make the result exactly symmetric.
+    let limited = this.limited;
+    this.relax(length, perpendicular);
+    this.limited = limited || this.limited;
+    // Smoothing moves points along the curves, so match them up again before the final averaging.
+    let nearly = this.pos.slice();
+    let S3 = measure();
+    plan.forEach((pl, ai) => {
+      if (!pl) return;
+      let f = fit(S3[ai], S3[pl.B], pl.axis);
+      if (f.cost < Infinity) pl.map = f.map;
+    });
+    average();
+    if (this.count_intersections() > this.baseline) this.pos = nearly; // already nearly symmetric
+
+    if (this.count_intersections() > this.baseline) {
+      this.pos = original;
+      this.symmetry = "Symmetrizing would change the diagram, so it was not done.";
+      return;
+    }
+    let where = S.length > 1 && count === S.length && own === 0 ? "about a common axis" : "";
+    this.symmetry = count === S.length
+      ? `Symmetrized ${S.length > 1 ? "all " + S.length + " components " : ""}${where}`.trim() + "."
+      : `Symmetrized ${count} of ${S.length} components; the others are not close to symmetric.`;
+  }
+
   crossing_angles() {
     /* The (unsigned, at most 90 degree) angle between the strands at each crossing, in degrees. */
     let pos = this.pos, angles = [];
@@ -156,7 +412,7 @@ export class SmoothedDiagram {
        straight perpendicular strands through the crossing (recomputed over a few rounds). */
     if (length <= 0 && !perpendicular) return;
     let x0 = this.pos.slice();
-    let baseline = this.count_intersections();
+    let baseline = this.baseline;
     let alpha0 = Math.pow(Math.max(length, 2 * SAMPLE_SPACING) / (2 * Math.PI * SAMPLE_SPACING), 4);
     let attempts = [];
     (perpendicular ? [true, false] : [false]).forEach(perp => {
@@ -661,6 +917,96 @@ export function to_tikz(sd, opts) {
   return out.join("\n") + "\n";
 }
 
+/* PDF uses the standard Times-Roman and Symbol fonts, which every PDF reader has, so nothing needs
+   embedding.  Labels are split into runs: minus signs and angle brackets come from Symbol. */
+const TIMES_WIDTHS = {"0": 500, "1": 500, "2": 500, "3": 500, "4": 500, "5": 500, "6": 500, "7": 500,
+                      "8": 500, "9": 500, "/": 278, ".": 250, ",": 250, " ": 250, "+": 564, "(": 333, ")": 333};
+const SYMBOL_CHARS = {"-": [0o055, 549], "<": [0o341, 329], ">": [0o361, 329]};
+
+function pdf_label_runs(text) {
+  /* Splits a label into [[font, pdf string, width in 1/1000 em], ...]. */
+  let runs = [];
+  for (let ch of text.replace(/\$/g, "")) {
+    let font = "F1", code, width;
+    if (SYMBOL_CHARS[ch]) {
+      font = "F2";
+      [code, width] = SYMBOL_CHARS[ch];
+      code = "\\" + code.toString(8).padStart(3, "0");
+    } else {
+      code = /[()\\]/.test(ch) ? "\\" + ch : (ch.charCodeAt(0) < 128 ? ch : "?");
+      width = TIMES_WIDTHS[ch] ?? 500;
+    }
+    let last = runs[runs.length - 1];
+    if (last && last[0] === font) { last[1] += code; last[2] += width; }
+    else runs.push([font, code, width]);
+  }
+  return runs;
+}
+
+export function to_pdf(sd, opts) {
+  let L = layout(sd, opts);
+  let num = x => (Math.round(x * 1000) / 1000).toString();
+  let pt = p => `${num(p[0])} ${num(L.height - p[1])}`;
+  let rgb = (c, colors) => {
+    let h = parseInt(hex(c, colors).slice(1), 16);
+    return [(h >> 16) / 255, ((h >> 8) & 255) / 255, (h & 255) / 255].map(num).join(" ");
+  };
+  let circle = ([cx, cy], r) => {
+    // four Bezier arcs
+    const k = 0.5523 * r;
+    let p = (x, y) => pt([cx + x, cy + y]);
+    return `${p(r, 0)} m ${p(r, k)} ${p(k, r)} ${p(0, r)} c ${p(-k, r)} ${p(-r, k)} ${p(-r, 0)} c `
+      + `${p(-r, -k)} ${p(-k, -r)} ${p(0, -r)} c ${p(k, -r)} ${p(r, -k)} ${p(r, 0)} c h`;
+  };
+  let c = [];
+  c.push(`1 J 1 j ${num(opts.line_width)} w`);
+  L.paths.forEach(path => {
+    let segs = bezier_segments(path.pts, path.closed, FIT_TOLERANCE * opts.line_width);
+    let d = `${pt(segs[0][0])} m`;
+    segs.forEach(([p0, c1, c2, p1]) => { d += ` ${pt(c1)} ${pt(c2)} ${pt(p1)} c`; });
+    c.push(`${rgb(path.color, opts.colors)} RG ${d}${path.closed ? " h" : ""} S`);
+  });
+  L.virtuals.forEach(p => {
+    c.push(`0 0 0 RG ${num(opts.line_width / 2)} w ${circle(p, opts.gap)} S ${num(opts.line_width)} w`);
+  });
+  L.arrows.forEach(a => {
+    let pts = arrow_points(a, opts.line_width);
+    c.push(`${rgb(a.color, opts.colors)} rg ${pt(pts[0])} m ${pts.slice(1).map(p => pt(p) + " l").join(" ")} h f`);
+  });
+  L.dots.forEach(d => { c.push(`${rgb(d.color, opts.colors)} rg ${circle(d.center, d.r)} f`); });
+  L.labels.forEach(l => {
+    let size = opts.label_size, runs = pdf_label_runs(l.text);
+    let width = runs.reduce((x, r) => x + r[2], 0) * size / 1000;
+    // Center the text box: shift down by about half the height of a digit.
+    let x = l.center[0] - width / 2, y = L.height - l.center[1] - 0.33 * size;
+    let t = `0 0 0 rg BT ${num(x)} ${num(y)} Td`;
+    runs.forEach(([font, code]) => { t += ` /${font} ${num(size)} Tf (${code}) Tj`; });
+    c.push(t + " ET");
+  });
+  let content = c.join("\n");
+
+  let objects = [
+    "<< /Type /Catalog /Pages 2 0 R >>",
+    "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+    `<< /Type /Page /Parent 2 0 R /MediaBox [0 0 ${num(L.width)} ${num(L.height)}] `
+      + "/Resources << /Font << /F1 5 0 R /F2 6 0 R >> >> /Contents 4 0 R >>",
+    `<< /Length ${content.length} >>\nstream\n${content}\nendstream`,
+    "<< /Type /Font /Subtype /Type1 /BaseFont /Times-Roman /Encoding /WinAnsiEncoding >>",
+    "<< /Type /Font /Subtype /Type1 /BaseFont /Symbol >>"
+  ];
+  let out = "%PDF-1.4\n";
+  let offsets = [];
+  objects.forEach((obj, i) => {
+    offsets.push(out.length);
+    out += `${i + 1} 0 obj\n${obj}\nendobj\n`;
+  });
+  let xref = out.length;
+  out += `xref\n0 ${objects.length + 1}\n0000000000 65535 f \n`;
+  offsets.forEach(o => { out += `${String(o).padStart(10, "0")} 00000 n \n`; });
+  out += `trailer\n<< /Size ${objects.length + 1} /Root 1 0 R >>\nstartxref\n${xref}\n%%EOF\n`;
+  return out;
+}
+
 function download(filename, text, mime) {
   let a = document.createElement("a");
   a.href = URL.createObjectURL(new Blob([text], {type: mime}));
@@ -685,6 +1031,7 @@ export function show_export_dialog(diag) {
         <label>Line width (pt) <input type="number" name="line_width" min="0.1" step="0.1" value="1.2"></label>
         <label>Crossing gap (pt) <input type="number" name="gap" min="0" step="0.5" value="4"></label>
         <label><input type="checkbox" name="perpendicular" checked> Perpendicular crossings</label>
+        <label><input type="checkbox" name="symmetrize"> Symmetrize</label>
         <label><input type="checkbox" name="colors" checked> Component colors</label>
         <label><input type="checkbox" name="arrows"> Orientation arrows</label>
         <div class="vector-export-kirby">
@@ -694,6 +1041,7 @@ export function show_export_dialog(diag) {
         <p class="vector-export-status"></p>
         <div class="vector-export-buttons">
           <input type="button" name="svg" value="Download SVG">
+          <input type="button" name="pdf" value="Download PDF">
           <input type="button" name="tikz" value="Download TikZ">
           <input type="button" name="copy" value="Copy TikZ">
           <input type="button" name="close" value="Close">
@@ -709,9 +1057,9 @@ export function show_export_dialog(diag) {
 
   let cache = new Map;
   let smoothed = () => {
-    let s = +$("smoothing").value, perp = $("perpendicular").checked;
-    let key = s + "," + perp;
-    if (!cache.has(key)) cache.set(key, new SmoothedDiagram(diag, s, perp));
+    let s = +$("smoothing").value, perp = $("perpendicular").checked, sym = $("symmetrize").checked;
+    let key = s + "," + perp + "," + sym;
+    if (!cache.has(key)) cache.set(key, new SmoothedDiagram(diag, s, perp, sym));
     return cache.get(key);
   };
   let opts = () => ({
@@ -731,10 +1079,12 @@ export function show_export_dialog(diag) {
     let angles = sd.crossing_angles();
     let msg = angles.length ? `Crossing angles: ${Math.round(Math.min(...angles))}\u00b0\u2013${Math.round(Math.max(...angles))}\u00b0. ` : "";
     if (sd.limited) msg += "Smoothing was reduced so that no new crossings are introduced.";
+    if (sd.symmetry) msg += " " + sd.symmetry;
     status.textContent = msg;
   };
   overlay.querySelectorAll("input").forEach(el => el.addEventListener("input", update));
   $("svg").addEventListener("click", () => download("knot.svg", to_svg(smoothed(), opts()), "image/svg+xml"));
+  $("pdf").addEventListener("click", () => download("knot.pdf", to_pdf(smoothed(), opts()), "application/pdf"));
   $("tikz").addEventListener("click", () => download("knot.tikz", to_tikz(smoothed(), opts()), "text/x-tex"));
   $("copy").addEventListener("click", () => {
     navigator.clipboard.writeText(to_tikz(smoothed(), opts())).then(

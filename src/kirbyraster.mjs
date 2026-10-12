@@ -13,7 +13,7 @@
 
 import {Point} from "./geom2d.mjs";
 
-export function extract_kirby_marks(buf, skel, width, height) {
+export function extract_kirby_marks(buf, skel, width, height, second_pass=false) {
   /* buf is the painting and skel is its morphological thinning (from clean_up).  Both are modified
      in place to remove the marks.  Returns {dots: [Point], labels: [Point], unresolved: [Point]}. */
   let N = width * height;
@@ -50,7 +50,8 @@ export function extract_kirby_marks(buf, skel, width, height) {
       c.x0 = Math.min(c.x0, x); c.x1 = Math.max(c.x1, x);
       c.y0 = Math.min(c.y0, y); c.y1 = Math.max(c.y1, y);
       neighbors(j, k => {
-        if (buf[k] > 0 && comp[k] < 0) { comp[k] = c.id; stack.push(k); }
+        // pieces are connected strokes of one color
+        if (buf[k] === buf[i] && comp[k] < 0) { comp[k] = c.id; stack.push(k); }
       });
     }
   }
@@ -63,7 +64,7 @@ export function extract_kirby_marks(buf, skel, width, height) {
     // Number of branches: groups of neighboring skeleton pixels that touch each other.
     let nb = [];
     for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) {
-      if ((dx || dy) && skel[(y + dy) * width + x + dx] > 0) nb.push([dx, dy]);
+      if ((dx || dy) && skel[(y + dy) * width + x + dx] === skel[i]) nb.push([dx, dy]);
     }
     let count = nb.length;
     let parent = nb.map((_, k) => k);
@@ -108,10 +109,20 @@ export function extract_kirby_marks(buf, skel, width, height) {
     }
     dt[i] = v;
   }
-  let skel_dts = [];
-  for (let i = 0; i < N; i++) if (skel[i] > 0) skel_dts.push(dt[i]);
-  skel_dts.sort((a, b) => a - b);
-  let r0 = skel_dts[Math.floor(skel_dts.length / 2)]; // typical half-width of a stroke
+  // Typical half-width of a stroke.  (The thinned picture need not run down the middle of each
+  // stroke, so measure from all of the ink: across a stroke, the distance to the edge runs from 1
+  // up to the half-width, so a high percentile of it is close to the half-width.)
+  let half_width = values => {
+    if (values.length === 0) return 1;
+    values.sort((a, b) => a - b);
+    return Math.max(1, values[Math.floor(0.9 * (values.length - 1))]);
+  };
+  let all_dts = [];
+  for (let i = 0; i < N; i++) if (buf[i] > 0) all_dts.push(dt[i]);
+  let r0 = half_width(all_dts);
+  // Strokes can have quite different widths (different pens, or pressure), so also find the
+  // typical half-width of each piece.
+  let piece_r0 = comps.map(c => c.pixels.length >= 20 ? half_width(c.pixels.map(p => dt[p])) : r0);
 
   // --- Labels ---
   const LABEL_MAX = 0.1 * Math.min(width, height);
@@ -119,24 +130,61 @@ export function extract_kirby_marks(buf, skel, width, height) {
   const GAP_MAX = Math.max(14 * w, 80); // the largest distance across an under-crossing gap
   let all_endpoints = [];
   comps.forEach(c => c.endpoints.forEach(e => all_endpoints.push(e)));
+  let local_direction = (k, R, f) => {
+    /* The main direction (unit vector) of the ink of the piece containing pixel k, near it,
+       or with f given, the direction pointing out of the stroke end k. */
+    let kx = k % width, ky = (k - kx) / width, piece = comp[k], Ri = Math.ceil(R);
+    let n = 0, mx = 0, my = 0, sxx = 0, sxy = 0, syy = 0;
+    for (let dy = -Ri; dy <= Ri; dy++) for (let dx = -Ri; dx <= Ri; dx++) {
+      let x = kx + dx, y = ky + dy;
+      if (x < 0 || y < 0 || x >= width || y >= height || dx * dx + dy * dy > R * R) continue;
+      if (skel[y * width + x] > 0 && comp[y * width + x] === piece) {
+        n++; mx += dx; my += dy; sxx += dx * dx; sxy += dx * dy; syy += dy * dy;
+      }
+    }
+    if (n < 2) return null;
+    if (f) { let l = Math.hypot(mx, my) || 1; return [-mx / l, -my / l]; } // from the stroke toward its end
+    mx /= n; my /= n;
+    let a = sxx / n - mx * mx, b = sxy / n - mx * my, c = syy / n - my * my;
+    let theta = 0.5 * Math.atan2(2 * b, a - c);
+    return [Math.cos(theta), Math.sin(theta)];
+  };
   let has_partner = e => {
     /* Does this stroke end look like one side of an under-crossing?  That is, is there another
-       stroke end nearby, of a different piece, with a third piece (the over-strand) between them? */
+       stroke end nearby, of a different piece, facing it, with a third piece (the over-strand)
+       crossing the gap between them?  (The characters of a label like "3-n" are not like this:
+       the "-" runs along the gap rather than across it.) */
     let ex = e % width, ey = (e - ex) / width;
+    // Directions are measured close to the stroke end, since small circles curve tightly.
+    const NEAR = 2 * r0 + 5;
+    let de = local_direction(e, NEAR, true);
     return all_endpoints.some(f => {
       if (comp[f] === comp[e]) return false;
       let fx = f % width, fy = (f - fx) / width;
       let d = Math.hypot(fx - ex, fy - ey);
       if (d > GAP_MAX || d < 2) return false;
+      let ux = (fx - ex) / d, uy = (fy - ey) / d;
+      let df = local_direction(f, NEAR, true);
+      if (!de || !df || de[0] * ux + de[1] * uy < 0.3 || -(df[0] * ux + df[1] * uy) < 0.3) return false;
       for (let t = 2; t < d - 2; t += 0.5) {
-        let x = Math.round(ex + (fx - ex) * t / d), y = Math.round(ey + (fy - ey) * t / d);
+        let x = Math.round(ex + ux * t), y = Math.round(ey + uy * t);
         let k = y * width + x;
-        if (buf[k] > 0 && comp[k] !== comp[e] && comp[k] !== comp[f]) return true;
+        if (buf[k] > 0 && comp[k] !== comp[e] && comp[k] !== comp[f]) {
+          let dk = local_direction(k, 2.5 * w, false);
+          return !dk || Math.abs(dk[0] * ux + dk[1] * uy) < 0.87; // crosses at more than 30 degrees
+        }
       }
       return false;
     });
   };
-  let small = comps.filter(c => Math.max(c.x1 - c.x0, c.y1 - c.y0) <= LABEL_MAX);
+  // Specks (noise from photos, scans or compression) are just removed.
+  comps.forEach(c => {
+    if (c.pixels.length < 2 * r0 * r0) c.pixels.forEach(p => { buf[p] = 0; skel[p] = 0; });
+  });
+  let small = comps.filter(c => c.pixels.length >= 2 * r0 * r0 && Math.max(c.x1 - c.x0, c.y1 - c.y0) <= LABEL_MAX);
+  // Short arcs of the link between two crossings are simple pieces with two ends, both at
+  // under-crossings; they are not writing, and must not be grouped with nearby writing.
+  small = small.filter(c => !(c.endpoints.length === 2 && c.endpoints.every(e => has_partner(e))));
   // Group small components that are close together (like the "-" and "1" of "-1").
   let group = small.map((c, i) => i);
   let find = i => group[i] === i ? i : (group[i] = find(group[i]));
@@ -154,22 +202,22 @@ export function extract_kirby_marks(buf, skel, width, height) {
   });
   let labels = [];
   clusters.forEach(cs => {
-    let ids = new Set(cs.map(c => c.id));
     let x0 = Math.min(...cs.map(c => c.x0)), x1 = Math.max(...cs.map(c => c.x1));
     let y0 = Math.min(...cs.map(c => c.y0)), y1 = Math.max(...cs.map(c => c.y1));
     if (Math.max(x1 - x0, y1 - y0) > 1.5 * LABEL_MAX) return;
-    // A short arc of the link between two crossings has both of its ends at under-crossings.
-    let attached = 0;
-    cs.forEach(c => c.endpoints.forEach(e => { if (has_partner(e)) attached++; }));
-    if (attached >= 2) return;
+    // too small to be writing (judged by the label's own pen width)
+    if (Math.max(x1 - x0, y1 - y0) < 3 * Math.min(...cs.map(c => piece_r0[c.id]))) return;
     cs.forEach(c => c.pixels.forEach(p => { buf[p] = 0; skel[p] = 0; }));
     labels.push(new Point((x0 + x1) / 2, (y0 + y1) / 2));
   });
 
   // --- Dots ---
   let candidates = [];
-  let fat = Math.max(2 * r0 + 1.5, r0 + 3);
-  for (let i = 0; i < N; i++) if (buf[i] > 0 && dt[i] >= fat) candidates.push(i);
+  for (let i = 0; i < N; i++) {
+    if (buf[i] <= 0) continue;
+    let rc = piece_r0[comp[i]];
+    if (dt[i] >= Math.max(1.7 * rc + 1, rc + 2.5)) candidates.push(i);
+  }
   junctions.forEach(i => { if (buf[i] > 0) candidates.push(i); });
   // Cluster candidate pixels that are near each other.
   let cell = Math.max(4, Math.ceil(3 * w));
@@ -226,26 +274,99 @@ export function extract_kirby_marks(buf, skel, width, height) {
     });
   };
 
+  let repaired = 0;
+  let repair_fused = (cx, cy, r, piece) => {
+    /* An under-strand that touches its over-strand makes a T: two branches continue straight
+       through (the over-strand) and a third runs into it.  Cut a gap in the third branch, which
+       is the "little erasing" that would otherwise have to be done by hand. */
+    for (let R = Math.max(r, 2 * w); R <= r + 3 * w; R += 1) {
+      let runs = ring(cx, cy, R, piece);
+      if (!runs) continue;
+      runs = runs.filter(run => run.length > 2);
+      if (runs.length !== 3 || !runs.every(run => run.length <= 1.6 * w + 3)) continue;
+      // The over-strand is the pair of branches closest to opposite each other.
+      let best = null;
+      for (let i = 0; i < 3; i++) for (let j = i + 1; j < 3; j++) {
+        let d = Math.abs(((runs[i].angle - runs[j].angle) % (2 * Math.PI) + 3 * Math.PI) % (2 * Math.PI) - Math.PI);
+        if (!best || d < best.d) best = {d, i, j, k: 3 - i - j};
+      }
+      if (best.d > 50 * Math.PI / 180) return false;
+      let a = runs[best.i].angle, b = runs[best.j].angle, u = runs[best.k];
+      // direction of the over-strand, and of the branch running into it
+      let ox = Math.cos(a) - Math.cos(b), oy = Math.sin(a) - Math.sin(b), on = Math.hypot(ox, oy) || 1;
+      ox /= on; oy /= on;
+      let half = u.length / (2 * R) + 0.35;
+      let reach = R + 1.5 * w, Ri = Math.ceil(reach);
+      for (let dy = -Ri; dy <= Ri; dy++) for (let dx = -Ri; dx <= Ri; dx++) {
+        let x = Math.round(cx) + dx, y = Math.round(cy) + dy;
+        if (x < 0 || y < 0 || x >= width || y >= height) continue;
+        let px = x - cx, py = y - cy, dist = Math.hypot(px, py);
+        if (dist > reach) continue;
+        let off = Math.abs(px * oy - py * ox); // distance from the over-strand's center line
+        if (off < r0 + 1.5) continue;
+        let ang = Math.atan2(py, px), da = Math.abs(((ang - u.angle) % (2 * Math.PI) + 3 * Math.PI) % (2 * Math.PI) - Math.PI);
+        if (da > half) continue;
+        let k = y * width + x;
+        if (comp[k] === piece) { buf[k] = 0; skel[k] = 0; }
+      }
+      repaired++;
+      return true;
+    }
+    return false;
+  };
+
   let dots = [], unresolved = [];
   dot_clusters.forEach(pixels => {
     // Only consider the piece of the picture that the dot is part of.
     let piece = comp[pixels[0]];
     pixels = pixels.filter(p => comp[p] === piece);
+    let rp = piece_r0[piece];
     let cx = 0, cy = 0;
     pixels.forEach(p => { let x = p % width; cx += x; cy += (p - x) / width; });
     cx /= pixels.length; cy /= pixels.length;
-    let r = r0;
-    pixels.forEach(p => { let x = p % width, y = (p - x) / width; r = Math.max(r, Math.hypot(x - cx, y - cy) + dt[p]); });
+    let r = rp, extent = 0, sxx = 0, sxy = 0, syy = 0;
+    pixels.forEach(p => {
+      let x = p % width, y = (p - x) / width, d = Math.hypot(x - cx, y - cy);
+      r = Math.max(r, d + dt[p]);
+      extent = Math.max(extent, d);
+      sxx += (x - cx) * (x - cx); sxy += (x - cx) * (y - cy); syy += (y - cy) * (y - cy);
+    });
+    // A dot (filled or scribbled) is about as wide as it is long; a thick stretch of a stroke
+    // is long and narrow, so it is not a dot.
+    let tr = (sxx + syy) / pixels.length, det = (sxx * syy - sxy * sxy) / (pixels.length * pixels.length);
+    let disc = Math.sqrt(Math.max(0, tr * tr / 4 - det));
+    let major = tr / 2 + disc, minor = Math.max(1e-9, tr / 2 - disc);
+    if (extent > 3 * rp + 3 && major > 9 * minor) return;
+    // Nothing much bigger than a few stroke widths is a dot.
+    if (r > 6 * rp + 10) return;
     // Grow the radius until the circle only meets ordinary strokes, then see where they leave.
     // (Specks of one or two pixels are ignored.)
     let R = r, runs = null, found = false;
-    for (; R <= r + 10 * w + 10; R += 1) {
+    // Never look further than a few stroke widths, so that a mistake cannot erase a large area.
+    for (; R <= r + 3 * w + 4; R += 1) {
       runs = ring(cx, cy, R, piece);
       if (runs) runs = runs.filter(run => run.length > 2);
       if (runs && runs.length === 2 && runs.every(run => run.length <= 1.6 * w + 3)) { found = true; break; }
     }
     if (!found) {
-      unresolved.push(new Point(cx, cy));
+      if (!repair_fused(cx, cy, r, piece)) unresolved.push(new Point(cx, cy));
+      return;
+    }
+    // A dot carries much more ink than a plain stroke passing through the same circle.  (A short
+    // stub sticking out of a stroke also makes a junction, but not much extra ink.)
+    let mass = 0, Rm = Math.ceil(R);
+    for (let dy = -Rm; dy <= Rm; dy++) for (let dx = -Rm; dx <= Rm; dx++) {
+      let x = Math.round(cx) + dx, y = Math.round(cy) + dy;
+      if (x < 0 || y < 0 || x >= width || y >= height || Math.hypot(x - cx, y - cy) > R) continue;
+      let k = y * width + x;
+      if (buf[k] > 0 && comp[k] === piece) mass++;
+    }
+    // Otherwise it is just a stroke with a spur, which is cleaned up the same way but is not a dot.
+    let line_width = Math.max(1, 2 * rp - 1); // stroke width from its measured half-thickness
+    let is_dot = mass >= 1.5 * 2 * R * line_width;
+    // A junction that is not a dot is cleaned up only if it is small (a spur on a stroke).
+    if (!is_dot && R > r + 1.5 * w + 2) {
+      if (!repair_fused(cx, cy, r, piece)) unresolved.push(new Point(cx, cy));
       return;
     }
     let ends = runs.map(run => [cx + (R + 1) * Math.cos(run.angle), cy + (R + 1) * Math.sin(run.angle)]);
@@ -302,8 +423,13 @@ export function extract_kirby_marks(buf, skel, width, height) {
         skel[y * width + x] = color;
       }
     }
-    dots.push(new Point(cx, cy));
+    if (is_dot) dots.push(new Point(cx, cy));
   });
 
+  if (repaired > 0 && !second_pass) {
+    // Cutting fused crossings can free writing that touched a strand, so look again.
+    let again = extract_kirby_marks(buf, skel, width, height, true);
+    return {dots: dots.concat(again.dots), labels: labels.concat(again.labels), unresolved: again.unresolved};
+  }
   return {dots, labels, unresolved};
 }

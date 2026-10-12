@@ -5,6 +5,9 @@ import Q from "./kq.mjs";
 import {KnotRasterView} from "./KnotRasterView.mjs";
 import {Point} from "./geom2d.mjs";
 import {stackBlurRGB} from "./StackBlur.mjs";
+import {remove_grid_lines} from "./gridremoval.mjs";
+import {classify_ink_colors} from "./inkcolors.mjs";
+import {palette} from "./constants.mjs";
 
 let global_tool_state = {
   tool: "crop"
@@ -33,6 +36,8 @@ export class KnotImageImportView {
     this.blur = 0;
     this.adaptive = 20;
     this.threshold = -0.05;
+    this.remove_grid = false;
+    this.keep_colors = true;
 
     this.tmp_canvas = document.createElement("canvas");
     this.tmp_canvas.width = this.width;
@@ -54,6 +59,9 @@ export class KnotImageImportView {
     view.invert = this.invert;
     view.blur = this.blur;
     view.threshold = this.threshold;
+    view.adaptive = this.adaptive;
+    view.remove_grid = this.remove_grid;
+    view.keep_colors = this.keep_colors;
     return view;
   }
 
@@ -252,6 +260,31 @@ export class KnotImageImportView {
     $div.append(Q.create("br"));
 
     $div.append(
+      Q.create("label", {title: "Keep the colors of the drawing.  Components drawn in different colors are then never"
+                                + " confused with each other, which makes conversion much more reliable."},
+               "Keep colors: ",
+               Q.create("input", {type: "checkbox", checked: this.keep_colors})
+               .on("input", e => {
+                 this.keep_colors = e.target.checked;
+                 this.paint(ctxt);
+               })
+              ));
+
+    $div.append(Q.create("br"));
+
+    $div.append(
+      Q.create("label", {title: "Remove graph paper: regularly spaced straight lines running across the picture"},
+               "Remove grid lines: ",
+               Q.create("input", {type: "checkbox", checked: this.remove_grid})
+               .on("input", e => {
+                 this.remove_grid = e.target.checked;
+                 this.paint(ctxt);
+               })
+              ));
+
+    $div.append(Q.create("br"));
+
+    $div.append(
       Q.create("input", {type: "button",
                          value: "Accept",
                          title: "Take selection to painting mode"})
@@ -345,6 +378,8 @@ export class KnotImageImportView {
       gdata[i] = c;
     }
 
+    let colors = this.keep_colors && !do_invert ? data.slice() : null;
+
     stackBlurRGB(data, width, height, this.adaptive);
 
     // threshold
@@ -355,9 +390,19 @@ export class KnotImageImportView {
       gdata[i] = c;
     }
 
+    if (this.remove_grid) {
+      remove_grid_lines(gdata, width, height);
+    }
+
+    let classes = colors ? classify_ink_colors(colors, gdata.map(c => c === 0), width, height) : null;
     for (let i = 0; i < gdata.length; i++) {
       let c = gdata[i];
-      data[4*i] = data[4*i+1] = data[4*i+2] = c;
+      if (classes && c === 0) {
+        let hex = palette[classes[i] - 1];
+        data[4*i] = (hex >>> 16) & 255; data[4*i+1] = (hex >>> 8) & 255; data[4*i+2] = hex & 255;
+      } else {
+        data[4*i] = data[4*i+1] = data[4*i+2] = c;
+      }
       data[4*i+3] = 255;
     }
 
